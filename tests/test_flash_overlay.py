@@ -108,21 +108,33 @@ class TestCancelActiveFlash:
         assert flash_overlay._active_overlay is None
 
 
-class TestLayerColor:
-    def test_full_intensity_returns_orange_red(self):
-        assert flash_overlay._layer_color(1.0).upper() == "#FF4500"
+class TestBuildStripDefs:
+    def test_region_layer_zero_sits_on_rect_edge_with_full_alpha(self):
+        defs = flash_overlay._build_strip_defs([(100, 200, 500, 400)], full_screen=False)
+        # First strip stack is layer 0 (full alpha); 4 strips per layer.
+        layer0 = [d for d in defs if d[4] == 1.0]
+        assert len(layer0) == 4
+        # Layer 0 is offset outward by 1 * _LAYER_THICKNESS so the inner edge
+        # of the strip aligns with the rect edge.
+        thickness = flash_overlay._LAYER_THICKNESS
+        top, bottom, left, right = layer0
+        assert top == (100 - thickness, 200 - thickness, 500 + thickness, 200, 1.0)
+        assert bottom == (100 - thickness, 400, 500 + thickness, 400 + thickness, 1.0)
 
-    def test_half_intensity_blends_toward_black(self):
-        c = flash_overlay._layer_color(0.5)
-        # 0xFF * 0.5 = 127 -> 7F; 0x45 * 0.5 = 34 -> 22; 0x00 * 0.5 = 0 -> 00.
-        assert c.upper() == "#7F2200"
+    def test_full_screen_strips_inset_inward_from_edge(self):
+        defs = flash_overlay._build_strip_defs([(0, 0, 1000, 800)], full_screen=True)
+        layer0 = [d for d in defs if d[4] == 1.0]
+        assert len(layer0) == 4
+        inset = flash_overlay._FULLSCREEN_INSET
+        thickness = flash_overlay._LAYER_THICKNESS
+        # Top strip: y range is [inset, inset+thickness]
+        top = next(d for d in layer0 if d[3] - d[1] == thickness and d[2] - d[0] > thickness)
+        assert top[1] == inset
+        assert top[3] == inset + thickness
 
-    def test_zero_intensity_avoids_pure_black(self):
-        # Pure black is the transparent-colour key; the helper must not return it
-        # because a 0-intensity layer would otherwise punch a hole in the canvas.
-        c = flash_overlay._layer_color(0.0)
-        assert c.upper() != "#000000"
-        assert c.upper() == "#010000"
+    def test_too_small_full_screen_rect_produces_no_strips(self):
+        defs = flash_overlay._build_strip_defs([(0, 0, 4, 4)], full_screen=True)
+        assert defs == []
 
 
 class TestRunOverlayFallthrough:
