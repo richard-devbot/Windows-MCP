@@ -1,8 +1,12 @@
 """Brief on-screen visual confirmation that a screenshot was taken.
 
-Draws a glowing orange-red border over the captured area for ~1 second using
-a transparent always-on-top Tk window on a daemon thread. The flash is started
-*after* the screenshot is captured so it never appears in the captured image.
+Renders a glowing orange-red halo around the captured area for ~2.5 s and
+then fades out. Implementation uses one ``tk.Toplevel`` per glow layer per
+side (top/bottom/left/right) so per-window ``-alpha`` works reliably — the
+``-alpha`` + ``-transparentcolor`` combination is unreliable on Windows.
+
+The flash is started *after* capture and any active overlay is torn down
+before the next capture, so it never appears in a captured image.
 """
 
 import logging
@@ -15,8 +19,8 @@ logger = logging.getLogger(__name__)
 _FLASH_COLOR = "#FF4500"
 _DURATION_MS = 2500
 _FRAME_INTERVAL_MS = 20
-_BORDER_THICKNESS = 6
-_FULLSCREEN_INSET = 12
+_GLOW_LAYERS = 8
+_FULLSCREEN_INSET = 4
 
 _lock = threading.Lock()
 _active_overlay: "_Overlay | None" = None
@@ -55,12 +59,12 @@ def show_capture_flash(
     *,
     full_screen: bool,
 ) -> None:
-    """Show a fade-in/out orange-red border over each rect.
+    """Show a fade-in/out orange-red glow over each rect.
 
     ``rects`` are ``(left, top, right, bottom)`` tuples in virtual-screen
-    coordinates. ``full_screen=True`` draws an inner border that fades in
-    then out (used when no region was specified). ``full_screen=False`` keeps
-    the border solid for most of the duration and fades out at the end.
+    coordinates. ``full_screen=True`` draws an inner glow that radiates
+    inward from each monitor edge. ``full_screen=False`` draws an outer
+    halo around the captured region.
 
     Returns immediately; rendering happens on a daemon thread.
     """
@@ -80,6 +84,39 @@ def show_capture_flash(
     overlay.thread.start()
 
 
+def _build_strip_defs(
+    rects: list[tuple[int, int, int, int]],
+    full_screen: bool,
+) -> list[tuple[int, int, int, int, float]]:
+    """Return ``(l, t, r, b, base_alpha)`` strip rects for every glow layer.
+
+    For region mode the strips spread *outward* from the rect edge; for
+    full-screen mode they spread *inward* from each monitor edge. Layer 0
+    sits exactly on the rect/edge boundary at full opacity; subsequent
+    layers step further away with a quadratic falloff.
+    """
+    strips: list[tuple[int, int, int, int, float]] = []
+    base_inset = _FULLSCREEN_INSET if full_screen else 0
+    for r_left, r_top, r_right, r_bottom in rects:
+        for layer in range(_GLOW_LAYERS):
+            falloff = (1.0 - layer / _GLOW_LAYERS) ** 2
+            if full_screen:
+                offset = base_inset + layer
+            else:
+                offset = -layer
+            left = r_left + offset
+            top = r_top + offset
+            right = r_right - offset
+            bottom = r_bottom - offset
+            if right - left < 2 or bottom - top < 2:
+                continue
+            strips.append((left, top, right, top + 1, falloff))
+            strips.append((left, bottom - 1, right, bottom, falloff))
+            strips.append((left, top, left + 1, bottom, falloff))
+            strips.append((right - 1, top, right, bottom, falloff))
+    return strips
+
+
 def _run_overlay(
     rects: list[tuple[int, int, int, int]],
     full_screen: bool,
@@ -94,63 +131,30 @@ def _run_overlay(
 
     root: "tk.Tk | None" = None
     try:
-        left = min(r[0] for r in rects)
-        top = min(r[1] for r in rects)
-        right = max(r[2] for r in rects)
-        bottom = max(r[3] for r in rects)
-        width = right - left
-        height = bottom - top
-        if width <= 0 or height <= 0:
+        strip_defs = _build_strip_defs(rects, full_screen)
+        if not strip_defs:
             return
 
         root = tk.Tk()
         root.withdraw()
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        try:
-            root.attributes("-disabled", True)
-        except tk.TclError:
-            pass
 
-        transparent_color = "#010203"
-        try:
-            root.configure(bg=transparent_color)
-            root.attributes("-transparentcolor", transparent_color)
-            canvas_bg = transparent_color
-        except tk.TclError:
-            canvas_bg = root.cget("bg")
+        strip_windows: list[tuple["tk.Toplevel", float]] = []
+        for left, top, right, bottom, base_alpha in strip_defs:
+            w = tk.Toplevel(root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            try:
+                w.attributes("-toolwindow", True)
+            except tk.TclError:
+                pass
+            w.configure(bg=_FLASH_COLOR)
+            w.geometry(f"{right - left}x{bottom - top}+{left}+{top}")
+            try:
+                w.attributes("-alpha", base_alpha)
+            except tk.TclError:
+                pass
+            strip_windows.append((w, base_alpha))
 
-        root.geometry(f"{width}x{height}+{left}+{top}")
-
-        canvas = tk.Canvas(
-            root,
-            width=width,
-            height=height,
-            bg=canvas_bg,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        canvas.pack(fill="both", expand=True)
-
-        inset = _FULLSCREEN_INSET if full_screen else 0
-        for r_left, r_top, r_right, r_bottom in rects:
-            x1 = r_left - left + inset
-            y1 = r_top - top + inset
-            x2 = r_right - left - inset - 1
-            y2 = r_bottom - top - inset - 1
-            if x2 - x1 <= 0 or y2 - y1 <= 0:
-                continue
-            for i in range(_BORDER_THICKNESS):
-                canvas.create_rectangle(
-                    x1 + i,
-                    y1 + i,
-                    x2 - i,
-                    y2 - i,
-                    outline=_FLASH_COLOR,
-                    width=1,
-                )
-
-        root.deiconify()
         start = time.perf_counter()
 
         def tick() -> None:
@@ -161,15 +165,20 @@ def _run_overlay(
             if elapsed_ms >= _DURATION_MS:
                 root.destroy()
                 return
-            t = elapsed_ms / _DURATION_MS
+            t_norm = elapsed_ms / _DURATION_MS
             if full_screen:
-                alpha = 1.0 - abs(2 * t - 1)
+                time_alpha = 1.0 - abs(2 * t_norm - 1)
+            elif t_norm < 0.15:
+                time_alpha = t_norm / 0.15
+            elif t_norm < 0.65:
+                time_alpha = 1.0
             else:
-                alpha = 1.0 if t < 0.65 else max(0.0, 1.0 - (t - 0.65) / 0.35)
-            try:
-                root.attributes("-alpha", max(0.0, min(1.0, alpha)))
-            except tk.TclError:
-                pass
+                time_alpha = max(0.0, 1.0 - (t_norm - 0.65) / 0.35)
+            for w, base_alpha in strip_windows:
+                try:
+                    w.attributes("-alpha", max(0.0, min(1.0, base_alpha * time_alpha)))
+                except tk.TclError:
+                    pass
             root.after(_FRAME_INTERVAL_MS, tick)
 
         root.after(0, tick)
